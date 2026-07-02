@@ -441,96 +441,164 @@ if TORCH_AVAILABLE:
         out = torch.stack([rx, ry, rz], dim=1) + com.unsqueeze(0)
         return out.cpu().numpy()
 
-    def _torch_contact_forces(
-        centroids_local_np, areas_local_np, values_np, origin_np, spacing_np,
-        translation_np, velocity_np, kn, alpha, cn, mu, ct, method_flag,
-    ):
-        """Vectorised contact force evaluation on GPU via PyTorch.
 
-        Returns (points, forces, normals, phis, depths, pressures, energies,
-                 total_force, total_torque, contact_area, contact_count).
-        """
-        dev = torch.device("cuda")
+def _torch_contact_forces_cached_impl(gc, translation_np, velocity_np, kn, alpha, cn, mu, ct, method_flag):
+    """Evaluate contact forces using GPU-resident cached tensors."""
+    dev = gc["centroids"].device
+    N = gc["centroids"].shape[0]
 
-        centroids = torch.from_numpy(centroids_local_np).to(device=dev, dtype=torch.float64)
-        areas = torch.from_numpy(areas_local_np).to(device=dev, dtype=torch.float64)
-        translation = torch.from_numpy(translation_np).to(device=dev, dtype=torch.float64)
-        velocity = torch.from_numpy(velocity_np).to(device=dev, dtype=torch.float64)
+    # Only transfer translation + velocity (6 floats)
+    gc["translation"].copy_(torch.from_numpy(translation_np).to(dev))
+    gc["velocity"].copy_(torch.from_numpy(velocity_np).to(dev))
 
-        points = centroids + translation.unsqueeze(0)
+    # World-space points = centroids + translation (single in-place op)
+    points = gc["centroids"] + gc["translation"].unsqueeze(0)
 
-        if method_flag == 0:
-            phi_np, grad_np = _torch_trilinear_sample(values_np, origin_np, spacing_np, points.cpu().numpy())
-        else:
-            phi_np, grad_np = _torch_tricubic_sample(values_np, origin_np, spacing_np, points.cpu().numpy())
+    # ── SDF sampling on GPU (no CPU transfer) ──
+    nx, ny, nz = gc["values"].shape
+    flat = gc["flat"]
+    origin = gc["origin"]
+    spacing = gc["spacing"]
 
-        phi = torch.from_numpy(phi_np).to(device=dev, dtype=torch.float64)
-        grad = torch.from_numpy(grad_np).to(device=dev, dtype=torch.float64)
+    ux = (points[:, 0] - origin[0]) / spacing[0]
+    uy = (points[:, 1] - origin[1]) / spacing[1]
+    uz = (points[:, 2] - origin[2]) / spacing[2]
 
-        gl = torch.norm(grad, dim=1)
-        normals = torch.zeros_like(grad)
-        mask_valid = gl > 1e-12
-        normals[mask_valid] = grad[mask_valid] / gl[mask_valid, None]
-        normals[~mask_valid] = torch.tensor([0.0, 0.0, 1.0], device=dev, dtype=torch.float64)
+    if method_flag == 0:
+        # ── Trilinear (single batched 8-gather) ──
+        ix = torch.floor(ux).long().clamp(0, nx - 2)
+        iy = torch.floor(uy).long().clamp(0, ny - 2)
+        iz = torch.floor(uz).long().clamp(0, nz - 2)
+        ax = (ux - ix.double()).clamp(0.0, 1.0)
+        ay = (uy - iy.double()).clamp(0.0, 1.0)
+        az = (uz - iz.double()).clamp(0.0, 1.0)
 
-        depths = torch.clamp(-phi, min=0.0)
-        pressures = torch.zeros_like(phi)
-        active = depths > 0.0
+        offsets = torch.tensor([[0,0,0],[1,0,0],[0,1,0],[1,1,0],
+                                [0,0,1],[1,0,1],[0,1,1],[1,1,1]], device=dev, dtype=torch.long)
+        ox = (ix.unsqueeze(1) + offsets[:, 0]).clamp(0, nx - 1)
+        oy = (iy.unsqueeze(1) + offsets[:, 1]).clamp(0, ny - 1)
+        oz = (iz.unsqueeze(1) + offsets[:, 2]).clamp(0, nz - 1)
+        c = flat[ox * (ny * nz) + oy * nz + oz].double()
 
-        if active.any():
-            pressures[active] = kn * depths[active].pow(alpha)
-            vn = (normals[active] * velocity.unsqueeze(0)).sum(dim=1)
-            approaching = vn < 0.0
-            if approaching.any() and cn > 0.0:
-                active_idx = active.nonzero(as_tuple=True)[0]
-                app_in_active = approaching.nonzero(as_tuple=True)[0]
-                global_app = active_idx[app_in_active]
-                pressures[global_app] += cn * (-vn[app_in_active])
+        c00 = c[:, 0]*(1-ax) + c[:, 1]*ax
+        c10 = c[:, 2]*(1-ax) + c[:, 3]*ax
+        c01 = c[:, 4]*(1-ax) + c[:, 5]*ax
+        c11 = c[:, 6]*(1-ax) + c[:, 7]*ax
+        c0 = c00*(1-ay) + c10*ay
+        c1 = c01*(1-ay) + c11*ay
+        phi = c0*(1-az) + c1*az
 
-        fn = pressures * areas
-        forces = fn.unsqueeze(1) * normals
+        gx = (((c[:, 1]-c[:, 0])*(1-ay) + (c[:, 3]-c[:, 2])*ay) * (1-az)
+               + ((c[:, 5]-c[:, 4])*(1-ay) + (c[:, 7]-c[:, 6])*ay) * az) / spacing[0]
+        gy = (((c[:, 2]-c[:, 0])*(1-ax) + (c[:, 3]-c[:, 1])*ax) * (1-az)
+               + ((c[:, 6]-c[:, 4])*(1-ax) + (c[:, 7]-c[:, 5])*ax) * az) / spacing[1]
+        gz = (c1 - c0) / spacing[2]
+    else:
+        # ── Tricubic (single batched 64-gather) ──
+        bx = torch.floor(ux).long().clamp(1, nx - 3)
+        by = torch.floor(uy).long().clamp(1, ny - 3)
+        bz = torch.floor(uz).long().clamp(1, nz - 3)
+        tx = (ux - bx.double()).clamp(0.0, 1.0)
+        ty = (uy - by.double()).clamp(0.0, 1.0)
+        tz = (uz - bz.double()).clamp(0.0, 1.0)
 
-        if mu > 0.0 and active.any():
-            active_idx = active.nonzero(as_tuple=True)[0]
-            vn_all = (normals[active_idx] * velocity.unsqueeze(0)).sum(dim=1)
-            vt = velocity.unsqueeze(0) - vn_all.unsqueeze(1) * normals[active_idx]
-            vt_len = torch.norm(vt, dim=1)
-            ft_mag = mu * fn[active_idx]
-            moving = vt_len > 1e-14
-            ft = torch.zeros_like(vt)
-            if moving.any():
-                mi = active_idx[moving]
-                if ct > 0.0:
-                    ft_damp = torch.minimum(ct * vt_len[moving], ft_mag[moving])
-                    ft[moving] = -ft_damp.unsqueeze(1) * vt[moving] / vt_len[moving].unsqueeze(1)
-                else:
-                    ft[moving] = -ft_mag[moving].unsqueeze(1) * vt[moving] / vt_len[moving].unsqueeze(1)
-            forces[active_idx] += ft
+        def _cr_w_vec(t):
+            t2 = t*t; t3 = t2*t
+            return torch.stack([-0.5*t+t2-0.5*t3, 1.0-2.5*t2+1.5*t3,
+                                0.5*t+2.0*t2-1.5*t3, -0.5*t2+0.5*t3], dim=1)
+        def _cr_dw_vec(t):
+            t2 = t*t
+            return torch.stack([-0.5+2.0*t-1.5*t2, -5.0*t+4.5*t2,
+                                0.5+4.0*t-4.5*t2, -t+1.5*t2], dim=1)
 
-        energies = kn / (alpha + 1.0) * depths.pow(alpha + 1.0) * areas
-        total_force = forces.sum(dim=0)
-        total_torque = torch.cross(points - translation.unsqueeze(0), forces, dim=1).sum(dim=0)
+        wx = _cr_w_vec(tx);  wy = _cr_w_vec(ty);  wz = _cr_w_vec(tz)
+        dwx = _cr_dw_vec(tx); dwy = _cr_dw_vec(ty); dwz = _cr_dw_vec(tz)
 
-        return (
-            points.cpu().numpy(),
-            forces.cpu().numpy(),
-            normals.cpu().numpy(),
-            phi.cpu().numpy(),
-            depths.cpu().numpy(),
-            pressures.cpu().numpy(),
-            energies.cpu().numpy(),
-            total_force.cpu().numpy(),
-            total_torque.cpu().numpy(),
-            float(depths.gt(0.0).sum().item()),
-        )
+        a_idx = torch.arange(4, device=dev, dtype=torch.long)
+        a_v, b_v, c_v = torch.meshgrid(a_idx, a_idx, a_idx, indexing='ij')
+        ox = (bx.unsqueeze(1) + a_v.reshape(-1).unsqueeze(0) - 1).clamp(0, nx - 1)
+        oy = (by.unsqueeze(1) + b_v.reshape(-1).unsqueeze(0) - 1).clamp(0, ny - 1)
+        oz = (bz.unsqueeze(1) + c_v.reshape(-1).unsqueeze(0) - 1).clamp(0, nz - 1)
+        vals_64 = flat[ox * (ny * nz) + oy * nz + oz].double()
+
+        w_64 = (wx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)).reshape(N, 64)
+        phi = (w_64 * vals_64).sum(dim=1)
+
+        dwx_64 = (dwx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)).reshape(N, 64)
+        gx = (dwx_64 * vals_64).sum(dim=1) / spacing[0]
+        dwy_64 = (wx.unsqueeze(2).unsqueeze(3) * dwy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)).reshape(N, 64)
+        gy = (dwy_64 * vals_64).sum(dim=1) / spacing[1]
+        dwz_64 = (wx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * dwz.unsqueeze(1).unsqueeze(2)).reshape(N, 64)
+        gz = (dwz_64 * vals_64).sum(dim=1) / spacing[2]
+
+        local_min = vals_64.min(dim=1).values
+        local_max = vals_64.max(dim=1).values
+        phi = torch.clamp(phi, min=local_min, max=local_max)
+
+    # ── Normal, depth, force (all GPU, no transfer) ──
+    gl = torch.norm(torch.stack([gx, gy, gz], dim=1), dim=1)
+    normals = torch.zeros(N, 3, device=dev, dtype=torch.float64)
+    mask_v = gl > 1e-12
+    normals[mask_v] = torch.stack([gx[mask_v], gy[mask_v], gz[mask_v]], dim=1) / gl[mask_v, None]
+    normals[~mask_v] = torch.tensor([0.0, 0.0, 1.0], device=dev, dtype=torch.float64)
+
+    depths = torch.clamp(-phi, min=0.0)
+    pressures = torch.zeros(N, device=dev, dtype=torch.float64)
+    active = depths > 0.0
+
+    if active.any():
+        pressures[active] = kn * depths[active].pow(alpha)
+        vn = (normals[active] * gc["velocity"].unsqueeze(0)).sum(dim=1)
+        approaching = vn < 0.0
+        if approaching.any() and cn > 0.0:
+            app_idx = active.nonzero(as_tuple=True)[0][approaching.nonzero(as_tuple=True)[0]]
+            pressures[app_idx] += cn * (-vn[approaching])
+
+    areas = gc["areas"]
+    fn = pressures * areas
+    forces = fn.unsqueeze(1) * normals
+
+    if mu > 0.0 and active.any():
+        aidx = active.nonzero(as_tuple=True)[0]
+        vn_a = (normals[aidx] * gc["velocity"].unsqueeze(0)).sum(dim=1)
+        vt = gc["velocity"].unsqueeze(0) - vn_a.unsqueeze(1) * normals[aidx]
+        vt_len = torch.norm(vt, dim=1)
+        ft_mag = mu * fn[aidx]
+        moving = vt_len > 1e-14
+        ft = torch.zeros_like(vt)
+        if moving.any():
+            if ct > 0.0:
+                ft_damp = torch.minimum(ct * vt_len[moving], ft_mag[moving])
+                ft[moving] = -ft_damp.unsqueeze(1) * vt[moving] / vt_len[moving].unsqueeze(1)
+            else:
+                ft[moving] = -ft_mag[moving].unsqueeze(1) * vt[moving] / vt_len[moving].unsqueeze(1)
+        forces[aidx] += ft
+
+    energies = kn / (alpha + 1.0) * depths.pow(alpha + 1.0) * areas
+    total_force = forces.sum(dim=0)
+    total_torque = torch.cross(points - gc["translation"].unsqueeze(0), forces, dim=1).sum(dim=0)
+
+    # Single bulk transfer back to CPU
+    return (
+        points.cpu().numpy(),
+        forces.cpu().numpy(),
+        normals.cpu().numpy(),
+        phi.cpu().numpy(),
+        depths.cpu().numpy(),
+        pressures.cpu().numpy(),
+        energies.cpu().numpy(),
+        total_force.cpu().numpy(),
+        total_torque.cpu().numpy(),
+        int(active.sum().item()),
+    )
 
 
 class SurfaceContactEvaluator:
     """Batched face-quadrature contact force evaluator for explicit dynamics.
 
-    Supports translation-only or full 6-DOF (translation + rotation via quaternion).
-    Backends: numpy (vectorised), numba_cpu (parallel JIT), torch (GPU).
-    Coulomb friction with viscous tangential damping is available.
+    For torch backend, static data (SDF grid, centroids, areas) is cached on GPU
+    to eliminate per-step CPU↔GPU transfer overhead.  Only translation/velocity
+    (6 floats) are transferred each step.
     """
 
     def __init__(
@@ -557,6 +625,25 @@ class SurfaceContactEvaluator:
         self._values_np = np.asarray(self.grid.values, dtype=np.float32)
         self._origin_np = np.asarray(self.grid.origin, dtype=np.float64)
         self._spacing_np = np.asarray(self.grid.spacing, dtype=np.float64)
+
+        # Torch GPU-resident cache (populated lazily on first evaluate call)
+        self._gpu_cache = None
+
+    def _init_gpu_cache(self):
+        """Upload static tensors to GPU once."""
+        dev = torch.device("cuda")
+        self._gpu_cache = {
+            "centroids": torch.from_numpy(self.centroids_local).to(device=dev, dtype=torch.float64),
+            "areas": torch.from_numpy(self.areas).to(device=dev, dtype=torch.float64),
+            "values": torch.from_numpy(self._values_np).to(device=dev, dtype=torch.float32),
+            "origin": torch.from_numpy(self._origin_np).to(device=dev, dtype=torch.float64),
+            "spacing": torch.from_numpy(self._spacing_np).to(device=dev, dtype=torch.float64),
+            "translation": torch.zeros(3, device=dev, dtype=torch.float64),
+            "velocity": torch.zeros(3, device=dev, dtype=torch.float64),
+            # Pre-allocated output buffers
+            "points_buf": torch.zeros((len(self.centroids_local), 3), device=dev, dtype=torch.float64),
+            "flat": torch.from_numpy(self._values_np).reshape(-1).to(device=dev, dtype=torch.float32),
+        }
 
     @property
     def backend_used(self) -> str:
@@ -597,20 +684,18 @@ class SurfaceContactEvaluator:
         n = self.centroids_local.shape[0]
 
         if backend == "torch":
+            if self._gpu_cache is None:
+                self._init_gpu_cache()
+
             if use_rotation:
-                if TORCH_AVAILABLE:
-                    rotated = _torch_rotate_points(self.centroids_local, q, com_local)
-                else:
-                    rotated = _rotate_point_batch_cpu(self.centroids_local, q, com_local)
+                rotated = _torch_rotate_points(self.centroids_local, q, com_local)
                 world_pts_for_force = rotated + translation[None, :]
             else:
-                world_pts_for_force = self.centroids_local + translation[None, :]
+                world_pts_for_force = None  # computed inside cached path
 
             points, forces, normals, phis, depths, pressures, energies, total_force, total_torque, contact_count = \
-                _torch_contact_forces(
-                    self.centroids_local, self.areas,
-                    self._values_np, self._origin_np, self._spacing_np,
-                    translation, velocity, kn, alpha, cn, self.mu, self.ct, method_flag,
+                _torch_contact_forces_cached_impl(
+                    self._gpu_cache, translation, velocity, kn, alpha, cn, self.mu, self.ct, method_flag,
                 )
             total_energy = float(np.sum(energies))
 
