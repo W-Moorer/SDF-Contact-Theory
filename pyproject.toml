@@ -1,0 +1,17 @@
+[project]
+name = "sdf-mesh-contact-framework"
+version = "0.1.0"
+description = "SDF-Mesh contact mechanics validation framework with trilinear/tricubic SDF interpolation and GPU-ready backends."
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.24",
+  "scipy>=1.10",
+  "matplotlib>=3.7",
+  "plotly>=5.18",
+  "trimesh>=4.0",
+  "scikit-image>=0.22",
+  "numba>=0.58",
+]
+
+[tool.setuptools.packages.find]
+include = ["sdf_contact*"]
