@@ -32,11 +32,14 @@ def run_dynamics_case(
     kn: float = 8.0e4,
     alpha: float = 1.0,
     cn: float = 120.0,
+    mu: float = 0.0,
+    ct: float = 0.0,
     dt: float | None = None,
     steps: int | None = None,
     snapshot_stride: int = 30,
     exact_manifold_stride: int = 0,
     make_visuals: bool = True,
+    enable_rotation: bool = False,
 ) -> List[Dict]:
     case_root = Path(out_dir) / case.name
     case_root.mkdir(parents=True, exist_ok=True)
@@ -75,10 +78,14 @@ def run_dynamics_case(
             kn=kn,
             alpha=alpha,
             cn=cn,
+            mu=mu,
+            ct=ct,
             dt=dt,
             steps=steps,
             snapshot_stride=snapshot_stride,
             exact_manifold_stride=exact_manifold_stride,
+            enable_rotation=enable_rotation,
+            inertia_tensor=case.inertia_tensor,
         )
         runtime = time.perf_counter() - t0
         result.settings["runtime_seconds"] = float(runtime)
@@ -135,12 +142,15 @@ def run_dynamics_all(
     kn: float = 8.0e4,
     alpha: float = 1.0,
     cn: float = 120.0,
+    mu: float = 0.0,
+    ct: float = 0.0,
     dt: float | None = None,
     steps: int | None = None,
     snapshot_stride: int | None = None,
     exact_manifold_stride: int = 0,
     make_visuals: bool = True,
     case_limit: int | None = None,
+    enable_rotation: bool = False,
 ) -> List[Dict]:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -163,11 +173,14 @@ def run_dynamics_all(
             kn=kn,
             alpha=alpha,
             cn=cn,
+            mu=mu,
+            ct=ct,
             dt=dt,
             steps=steps,
             snapshot_stride=snapshot_stride,
             exact_manifold_stride=exact_manifold_stride,
             make_visuals=make_visuals,
+            enable_rotation=enable_rotation,
         )
         summary.extend(rows)
         _write_json(out_dir / "summary.partial.json", summary)

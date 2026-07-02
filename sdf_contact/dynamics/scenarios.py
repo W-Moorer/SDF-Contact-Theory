@@ -24,8 +24,7 @@ class DynamicsCase:
 
     The passive object is fixed and represented by the same SDFGrid interface as
     the static contact framework.  The active body is translated by the explicit
-    integrator; rotation is intentionally frozen in this validation stage so that
-    the response curves isolate the SDF/contact-force chain.
+    integrator; rotation is optionally enabled via ``enable_rotation``.
     """
 
     name: str
@@ -42,6 +41,9 @@ class DynamicsCase:
     expected: Dict
     description: str = ""
     local_com: np.ndarray | None = None
+    initial_orientation: np.ndarray | None = None
+    initial_angular_velocity: np.ndarray | None = None
+    inertia_tensor: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.initial_position = np.asarray(self.initial_position, dtype=np.float64).reshape(3)
@@ -52,6 +54,12 @@ class DynamicsCase:
             self.local_com = 0.5 * (mn + mx)
         else:
             self.local_com = np.asarray(self.local_com, dtype=np.float64).reshape(3)
+        if self.initial_orientation is not None:
+            self.initial_orientation = np.asarray(self.initial_orientation, dtype=np.float64).reshape(4)
+        if self.initial_angular_velocity is not None:
+            self.initial_angular_velocity = np.asarray(self.initial_angular_velocity, dtype=np.float64).reshape(3)
+        if self.inertia_tensor is not None:
+            self.inertia_tensor = np.asarray(self.inertia_tensor, dtype=np.float64).reshape(3, 3)
 
 
 def _params(quick: bool):

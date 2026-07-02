@@ -20,11 +20,14 @@ def main() -> None:
     p.add_argument("--kn", type=float, default=8.0e4)
     p.add_argument("--alpha", type=float, default=1.0)
     p.add_argument("--cn", type=float, default=120.0)
+    p.add_argument("--mu", type=float, default=0.0, help="Coulomb friction coefficient (0=no friction)")
+    p.add_argument("--ct", type=float, default=0.0, help="Tangential viscous damping coefficient")
     p.add_argument("--dt", type=float, default=None)
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--snapshot-stride", type=int, default=None)
     p.add_argument("--exact-manifold-stride", type=int, default=0, help="Optional expensive exact clipped-manifold snapshots.")
     p.add_argument("--case-limit", type=int, default=None)
+    p.add_argument("--enable-rotation", action="store_true", help="Enable 6-DOF with quaternion orientation update")
     p.add_argument("--no-visuals", action="store_true")
     args = p.parse_args()
     methods = ["linear", "cubic"] if args.method == "both" else [args.method]
@@ -40,12 +43,15 @@ def main() -> None:
         kn=args.kn,
         alpha=args.alpha,
         cn=args.cn,
+        mu=args.mu,
+        ct=args.ct,
         dt=args.dt,
         steps=args.steps,
         snapshot_stride=args.snapshot_stride,
         exact_manifold_stride=args.exact_manifold_stride,
         make_visuals=not args.no_visuals,
         case_limit=args.case_limit,
+        enable_rotation=args.enable_rotation,
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

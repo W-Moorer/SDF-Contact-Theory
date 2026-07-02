@@ -33,7 +33,12 @@ def save_response_curves(result: DynamicsResult, path: str | Path) -> None:
     t = result.time
     f_norm = np.linalg.norm(result.contact_force, axis=1)
 
-    fig, axes = plt.subplots(4, 1, figsize=(9, 11), sharex=True)
+    has_rot = result.angular_velocity is not None
+    n_rows = 5 if has_rot else 4
+    fig, axes = plt.subplots(n_rows, 1, figsize=(9, 2.5 * n_rows + 1), sharex=True)
+    if n_rows == 1:
+        axes = [axes]
+
     axes[0].plot(t, result.position[:, 2], label="z displacement")
     axes[0].set_ylabel("z [m]")
     axes[0].legend(loc="best")
@@ -52,10 +57,22 @@ def save_response_curves(result: DynamicsResult, path: str | Path) -> None:
 
     axes[3].plot(t, result.max_depth, label="max penetration depth")
     axes[3].plot(t, result.contact_area, label="estimated contact area")
-    axes[3].set_xlabel("time [s]")
     axes[3].set_ylabel("depth [m] / area [m²]")
     axes[3].legend(loc="best")
     _event_lines(axes[3], result.events)
+
+    if has_rot:
+        omega_norm = np.linalg.norm(result.angular_velocity, axis=1)
+        axes[4].plot(t, result.angular_velocity[:, 0], label="wx")
+        axes[4].plot(t, result.angular_velocity[:, 1], label="wy")
+        axes[4].plot(t, result.angular_velocity[:, 2], label="wz")
+        axes[4].plot(t, omega_norm, label="|omega|", linestyle="--")
+        axes[4].set_xlabel("time [s]")
+        axes[4].set_ylabel("angular vel [rad/s]")
+        axes[4].legend(loc="best")
+        _event_lines(axes[4], result.events)
+    else:
+        axes[3].set_xlabel("time [s]")
 
     fig.suptitle(f"{result.case_name} / {result.method} / {result.backend_used}")
     fig.tight_layout()
@@ -68,7 +85,9 @@ def save_energy_plot(result: DynamicsResult, path: str | Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     t = result.time
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(t, result.kinetic_energy, label="kinetic")
+    ax.plot(t, result.kinetic_energy, label="translational KE")
+    if result.rotational_energy is not None and np.any(result.rotational_energy > 0):
+        ax.plot(t, result.rotational_energy, label="rotational KE")
     ax.plot(t, result.gravitational_energy, label="gravitational")
     ax.plot(t, result.contact_energy, label="contact elastic")
     ax.plot(t, result.total_energy, label="total")
