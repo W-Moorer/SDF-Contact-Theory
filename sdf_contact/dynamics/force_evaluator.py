@@ -275,116 +275,151 @@ if TORCH_AVAILABLE:
         spacing = torch.from_numpy(spacing_np).to(device=dev, dtype=torch.float64)
         pts = torch.from_numpy(points_np).to(device=dev, dtype=torch.float64)
 
+        N = pts.shape[0]
         nx, ny, nz = values.shape
+        flat = values.reshape(-1)
+
         ux = (pts[:, 0] - origin[0]) / spacing[0]
         uy = (pts[:, 1] - origin[1]) / spacing[1]
         uz = (pts[:, 2] - origin[2]) / spacing[2]
 
-        ix = torch.floor(ux).long(); iy = torch.floor(uy).long(); iz = torch.floor(uz).long()
-        ax = ux - ix.double(); ay = uy - iy.double(); az = uz - iz.double()
-
-        ix = ix.clamp(0, nx - 2); iy = iy.clamp(0, ny - 2); iz = iz.clamp(0, nz - 2)
-        # Recompute fractional parts after clamping
+        ix = torch.floor(ux).long().clamp(0, nx - 2)
+        iy = torch.floor(uy).long().clamp(0, ny - 2)
+        iz = torch.floor(uz).long().clamp(0, nz - 2)
         ax = (ux - ix.double()).clamp(0.0, 1.0)
         ay = (uy - iy.double()).clamp(0.0, 1.0)
         az = (uz - iz.double()).clamp(0.0, 1.0)
 
-        idx = ix * (ny * nz) + iy * nz + iz
-        flat = values.reshape(-1)
+        # Single batched gather: 8 corners
+        offsets = torch.tensor([[0,0,0],[1,0,0],[0,1,0],[1,1,0],
+                                [0,0,1],[1,0,1],[0,1,1],[1,1,1]], device=dev, dtype=torch.long)
+        ox = (ix.unsqueeze(1) + offsets[:, 0]).clamp(0, nx - 1)
+        oy = (iy.unsqueeze(1) + offsets[:, 1]).clamp(0, ny - 1)
+        oz = (iz.unsqueeze(1) + offsets[:, 2]).clamp(0, nz - 1)
+        c = flat[ox * (ny * nz) + oy * nz + oz].double()  # (N, 8)
 
-        def gather(off_x, off_y, off_z):
-            ii = ix + off_x; jj = iy + off_y; kk = iz + off_z
-            ii = ii.clamp(0, nx - 1); jj = jj.clamp(0, ny - 1); kk = kk.clamp(0, nz - 1)
-            return flat[ii * (ny * nz) + jj * nz + kk].double()
+        # Trilinear interpolation: split into x-axis pairs
+        c00 = c[:, 0]*(1-ax) + c[:, 1]*ax  # y0z0
+        c10 = c[:, 2]*(1-ax) + c[:, 3]*ax  # y1z0
+        c01 = c[:, 4]*(1-ax) + c[:, 5]*ax  # y0z1
+        c11 = c[:, 6]*(1-ax) + c[:, 7]*ax  # y1z1
+        c0 = c00*(1-ay) + c10*ay
+        c1 = c01*(1-ay) + c11*ay
+        phi = c0*(1-az) + c1*az
 
-        c000 = gather(0, 0, 0); c100 = gather(1, 0, 0)
-        c010 = gather(0, 1, 0); c110 = gather(1, 1, 0)
-        c001 = gather(0, 0, 1); c101 = gather(1, 0, 1)
-        c011 = gather(0, 1, 1); c111 = gather(1, 1, 1)
-
-        c00 = c000 * (1 - ax) + c100 * ax
-        c10 = c010 * (1 - ax) + c110 * ax
-        c01 = c001 * (1 - ax) + c101 * ax
-        c11 = c011 * (1 - ax) + c111 * ax
-        c0 = c00 * (1 - ay) + c10 * ay
-        c1 = c01 * (1 - ay) + c11 * ay
-        phi = c0 * (1 - az) + c1 * az
-
-        gx = (((c100 - c000) * (1 - ay) + (c110 - c010) * ay) * (1 - az)
-               + ((c101 - c001) * (1 - ay) + (c111 - c011) * ay) * az) / spacing[0]
-        gy = (((c010 - c000) * (1 - ax) + (c110 - c100) * ax) * (1 - az)
-               + ((c011 - c001) * (1 - ax) + (c111 - c101) * ax) * az) / spacing[1]
+        gx = (((c[:, 1]-c[:, 0])*(1-ay) + (c[:, 3]-c[:, 2])*ay) * (1-az)
+               + ((c[:, 5]-c[:, 4])*(1-ay) + (c[:, 7]-c[:, 6])*ay) * az) / spacing[0]
+        gy = (((c[:, 2]-c[:, 0])*(1-ax) + (c[:, 3]-c[:, 1])*ax) * (1-az)
+               + ((c[:, 6]-c[:, 4])*(1-ax) + (c[:, 7]-c[:, 5])*ax) * az) / spacing[1]
         gz = (c1 - c0) / spacing[2]
 
         return phi.cpu().numpy(), torch.stack([gx, gy, gz], dim=1).cpu().numpy()
 
     def _torch_tricubic_sample(values_np, origin_np, spacing_np, points_np):
-        """Vectorised Catmull-Rom tricubic SDF sampling on GPU."""
+        """Fully-vectorised Catmull-Rom tricubic SDF sampling on GPU.
+
+        Key optimisation: the 4×4×4 = 64 gather offsets and weights are
+        computed as a single batched operation (no Python loop), reducing
+        CUDA kernel-launch overhead from 64 iterations to ~3-4.
+        """
         dev = torch.device("cuda")
         values = torch.from_numpy(values_np).to(device=dev, dtype=torch.float32)
-        origin = torch.from_numpy(origin_np).to(device=dev, dtype=np.float64 if not hasattr(torch, 'float64') else torch.float64)
         origin = torch.from_numpy(origin_np).to(device=dev, dtype=torch.float64)
         spacing = torch.from_numpy(spacing_np).to(device=dev, dtype=torch.float64)
         pts = torch.from_numpy(points_np).to(device=dev, dtype=torch.float64)
 
+        N = pts.shape[0]
         nx, ny, nz = values.shape
+        flat = values.reshape(-1)
+
         ux = (pts[:, 0] - origin[0]) / spacing[0]
         uy = (pts[:, 1] - origin[1]) / spacing[1]
         uz = (pts[:, 2] - origin[2]) / spacing[2]
 
-        bx = torch.floor(ux).long(); by = torch.floor(uy).long(); bz = torch.floor(uz).long()
-        tx = ux - bx.double(); ty = uy - by.double(); tz = uz - bz.double()
-
-        bx = bx.clamp(1, nx - 3); by = by.clamp(1, ny - 3); bz = bz.clamp(1, nz - 3)
+        bx = torch.floor(ux).long()
+        by = torch.floor(uy).long()
+        bz = torch.floor(uz).long()
+        bx = bx.clamp(1, nx - 3)
+        by = by.clamp(1, ny - 3)
+        bz = bz.clamp(1, nz - 3)
         tx = (ux - bx.double()).clamp(0.0, 1.0)
         ty = (uy - by.double()).clamp(0.0, 1.0)
         tz = (uz - bz.double()).clamp(0.0, 1.0)
 
-        flat = values.reshape(-1)
-        def cr_w(t, a):
+        # ── Catmull-Rom basis weights (all 4 at once, no branching) ──
+        def cr_w_vec(t):
             t2 = t * t; t3 = t2 * t
-            w = torch.zeros_like(t)
-            m0 = (a == 0); m1 = (a == 1); m2 = (a == 2); m3 = (a == 3)
-            w[m0] = (-0.5*t[m0] + t2[m0] - 0.5*t3[m0])
-            w[m1] = (1.0 - 2.5*t2[m1] + 1.5*t3[m1])
-            w[m2] = (0.5*t[m2] + 2.0*t2[m2] - 1.5*t3[m2])
-            w[m3] = (-0.5*t2[m3] + 0.5*t3[m3])
-            return w
-        def cr_dw(t, a):
+            return torch.stack([
+                -0.5*t + t2 - 0.5*t3,
+                 1.0 - 2.5*t2 + 1.5*t3,
+                 0.5*t + 2.0*t2 - 1.5*t3,
+                -0.5*t2 + 0.5*t3,
+            ], dim=1)  # (N, 4)
+
+        def cr_dw_vec(t):
             t2 = t * t
-            dw = torch.zeros_like(t)
-            m0 = (a == 0); m1 = (a == 1); m2 = (a == 2); m3 = (a == 3)
-            dw[m0] = (-0.5 + 2.0*t[m0] - 1.5*t2[m0])
-            dw[m1] = (-5.0*t[m1] + 4.5*t2[m1])
-            dw[m2] = (0.5 + 4.0*t[m2] - 4.5*t2[m2])
-            dw[m3] = (-t[m3] + 1.5*t2[m3])
-            return dw
+            return torch.stack([
+                -0.5 + 2.0*t - 1.5*t2,
+                -5.0*t + 4.5*t2,
+                 0.5 + 4.0*t - 4.5*t2,
+                -t + 1.5*t2,
+            ], dim=1)  # (N, 4)
 
-        phi = torch.zeros(len(pts), device=dev, dtype=torch.float64)
-        gx = torch.zeros_like(phi); gy = torch.zeros_like(phi); gz = torch.zeros_like(phi)
-        local_min = torch.full_like(phi, 1e30)
-        local_max = torch.full_like(phi, -1e30)
+        wx = cr_w_vec(tx)   # (N, 4)
+        wy = cr_w_vec(ty)   # (N, 4)
+        wz = cr_w_vec(tz)   # (N, 4)
+        dwx = cr_dw_vec(tx)  # (N, 4)
+        dwy = cr_dw_vec(ty)  # (N, 4)
+        dwz = cr_dw_vec(tz)  # (N, 4)
 
-        for a in range(4):
-            ix = (bx + a - 1).clamp(0, nx - 1)
-            wx = cr_w(tx, a); dwx = cr_dw(tx, a)
-            for b in range(4):
-                iy = (by + b - 1).clamp(0, ny - 1)
-                wy = cr_w(ty, b); dwy = cr_dw(ty, b)
-                for c in range(4):
-                    iz = (bz + c - 1).clamp(0, nz - 1)
-                    wz = cr_w(tz, c); dwz = cr_dw(tz, c)
-                    val = flat[ix * (ny * nz) + iy * nz + iz].double()
-                    w = wx * wy * wz
-                    phi += w * val
-                    gx += dwx * wy * wz * val
-                    gy += wx * dwy * wz * val
-                    gz += wx * wy * dwz * val
-                    local_min = torch.minimum(local_min, val)
-                    local_max = torch.maximum(local_max, val)
+        # ── Build all 64 integer offsets: (bx+a-1, by+b-1, bz+c-1) ──
+        # offsets_x[a,b,c] = bx + a - 1, etc.
+        a_idx = torch.arange(4, device=dev, dtype=torch.long)  # [0,1,2,3]
+        b_idx = a_idx
+        c_idx = a_idx
 
+        # Outer-product index grids: shape (4,4,4) → flatten to 64
+        # offset_x[i] = bx + a_vals[i] - 1
+        a_vals, b_vals, c_vals = torch.meshgrid(a_idx, b_idx, c_idx, indexing='ij')
+        a_flat = a_vals.reshape(-1)  # (64,)
+        b_flat = b_vals.reshape(-1)
+        c_flat = c_vals.reshape(-1)
+
+        # Compute all 64 index offsets per point: (N, 64)
+        ox = (bx.unsqueeze(1) + a_flat.unsqueeze(0) - 1).clamp(0, nx - 1)
+        oy = (by.unsqueeze(1) + b_flat.unsqueeze(0) - 1).clamp(0, ny - 1)
+        oz = (bz.unsqueeze(1) + c_flat.unsqueeze(0) - 1).clamp(0, nz - 1)
+        flat_idx = ox * (ny * nz) + oy * nz + oz  # (N, 64)
+
+        # Single batched gather: (N, 64)
+        vals_64 = flat[flat_idx].double()  # (N, 64)
+
+        # ── Compute all 64 tensor-product weights at once ──
+        # wx[:, a] * wy[:, b] * wz[:, c] for all 64 (a,b,c) combos
+        # Reshape wx/wy/wz to (N, 4, 1, 1), (N, 1, 4, 1), (N, 1, 1, 4)
+        # then broadcast multiply → (N, 4, 4, 4) → reshape to (N, 64)
+        w_3d = wx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)  # (N,4,4,4)
+        w_64 = w_3d.reshape(N, 64)
+
+        # Value weighted sum: phi = Σ w_i * val_i
+        phi = (w_64 * vals_64).sum(dim=1)
+
+        # Gradient: gx = Σ (dwx_a * wy_b * wz_c / spacing_x) * val_i
+        dwx_3d = dwx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)
+        gx = (dwx_3d.reshape(N, 64) * vals_64).sum(dim=1) / spacing[0]
+
+        dwy_3d = wx.unsqueeze(2).unsqueeze(3) * dwy.unsqueeze(1).unsqueeze(3) * wz.unsqueeze(1).unsqueeze(2)
+        gy = (dwy_3d.reshape(N, 64) * vals_64).sum(dim=1) / spacing[1]
+
+        dwz_3d = wx.unsqueeze(2).unsqueeze(3) * wy.unsqueeze(1).unsqueeze(3) * dwz.unsqueeze(1).unsqueeze(2)
+        gz = (dwz_3d.reshape(N, 64) * vals_64).sum(dim=1) / spacing[2]
+
+        # Clamp phi to local min/max (single reduction)
+        local_min = vals_64.min(dim=1).values
+        local_max = vals_64.max(dim=1).values
         phi = torch.clamp(phi, min=local_min, max=local_max)
-        return phi.cpu().numpy(), torch.stack([gx / spacing[0], gy / spacing[1], gz / spacing[2]], dim=1).cpu().numpy()
+
+        return phi.cpu().numpy(), torch.stack([gx, gy, gz], dim=1).cpu().numpy()
 
     def _torch_rotate_points(pts_np, quat_np, com_local_np):
         dev = torch.device("cuda")
