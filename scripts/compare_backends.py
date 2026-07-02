@@ -9,7 +9,7 @@ import numpy as np
 
 from sdf_contact.dynamics.scenarios import build_dynamics_cases
 from sdf_contact.dynamics.integrator import build_dynamic_sdf_grid, simulate_case
-from sdf_contact.dynamics.force_evaluator import NUMBA_AVAILABLE
+from sdf_contact.dynamics.force_evaluator import NUMBA_AVAILABLE, TORCH_AVAILABLE
 
 
 def compare_backends(
@@ -33,14 +33,10 @@ def compare_backends(
     grid = build_dynamic_sdf_grid(case, sdf_source="analytic", backend="auto", resolution=resolution)
 
     backends = ["numpy"]
+    if TORCH_AVAILABLE:
+        backends.append("torch")
     if NUMBA_AVAILABLE:
-        try:
-            import numba.cuda as cuda
-            if cuda.is_available():
-                backends.append("cuda")
-            backends.append("numba_cpu")
-        except Exception:
-            backends.append("numba_cpu")
+        backends.append("numba_cpu")
 
     results = {}
     for backend in backends:

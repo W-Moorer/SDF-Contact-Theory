@@ -15,7 +15,7 @@ def main() -> None:
     p.add_argument("--sdf-backend", default="auto", help="SDF generation backend when --sdf-source mesh: auto/cpu/cupy/warp")
     p.add_argument("--resolution", type=int, default=48)
     p.add_argument("--device", default="cuda:0")
-    p.add_argument("--dynamics-backend", choices=["auto", "cuda", "numba", "numba_cpu", "numpy"], default="auto")
+    p.add_argument("--dynamics-backend", choices=["auto", "torch", "cuda", "numba", "numba_cpu", "numpy"], default="auto")
     p.add_argument("--method", choices=["linear", "cubic", "both"], default="both")
     p.add_argument("--kn", type=float, default=8.0e4)
     p.add_argument("--alpha", type=float, default=1.0)
